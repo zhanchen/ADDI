@@ -1,0 +1,342 @@
+---
+title: "Detecting High-Quality Signals of Adverse Drug-Drug Interactions"
+author: "Chen Zhan"
+date: "15/04/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+The page provides a demo of R codes of our ADDI signal detection algorthim, which proposed in  _Detecting High-Quality Signals of Adverse Drug-Drug Interactions_.
+
+__Abstract:__
+
+As a medicine safety issue, Drug-Drug Interaction (DDI) may become an unexpected threat for causing Adverse Drug Events (ADEs). There is a growing demand for computational methods to efficiently and effectively analyse large-scale data to detect signals of Adverse Drug-drug Interactions (ADDIs). In this paper, we aim to detect high-quality signals of ADDIs which are non-spurious and non-redundant. We propose a new method which employs the framework of Bayesian network to infer the direct associations between the target ADE and medicines, and uses domain knowledge to facilitate the learning of Bayesian network structures. To improve efficiency and avoid redundancy, we design a level-wise algorithm with pruning strategy to search for high-quality ADDI signals. We have applied the proposed method to the United States Food and Drug Administration's (FDA) Adverse Event Reporting System (FAERS) data. The result shows that 54.45% of detected signals are verified as known DDIs and 10.89% were evaluated as high-quality ADDI signals, demonstrating that the proposed method could be a promising tool for ADDI signal detection.
+
+The high-quality signals detect by this experiment, as well as their evaluation results, are listed in http://nugget.unisa.edu.au/ADDI/Result_Rhab.xlsx
+
+Step 1: Load the FDA's AERS data.
+Its public version can be download from the FDA's website: https://fis.fda.gov/extensions/FPD-QDE-FAERS/FPD-QDE-FAERS.html
+
+We also attached a copy of 2018Q3 dataset of FAERS on this server, which can be found at http://nugget.unisa.edu.au/ADDI/ascii/
+
+```{r}
+#use 2018 Q3 data as an example, the FAERS is already structured data
+
+library(tictoc) # record processing time
+tic('total')
+
+tic('load FDA dataset' )
+library(readr) 
+
+#DRUG dataset contains information of medicines mentioned in reports
+DRUG18Q3 <- read_delim("~/rds/FDA/ascii/DRUG18Q3.txt", 
+                       "$", escape_double = FALSE, trim_ws = TRUE)
+
+#REAC dataset contains adverse event information mentioned in reports
+REAC18Q3 <- read_delim("~/rds/FDA/ascii/REAC18Q3.txt", 
+                       "$", escape_double = FALSE, trim_ws = TRUE)
+
+#DEMO dataset demographic informtion of patients mentioned in reports
+DEMO18Q3 <- read_delim("~/rds/FDA/ascii/DEMO18Q3.txt", 
+                       "$", escape_double = FALSE, trim_ws = TRUE)
+
+
+head(DEMO18Q3)
+head(DRUG18Q3)
+head(REAC18Q3)
+toc()
+```
+
+Data cleaning and preprocessing, including drug name standardisation and records de-duplication/duplication checking
+
+The drug name standardisation is recommended using MedEx, a natural language processing tool that designed for the extraction of medication information from clinical notes, which can be found in https://sbmi.uth.edu/ccb/resources/medex.htm.
+Here we present a simplified solution for this process.
+
+The idea of a simplified solution is to impute the missing generic names by checking other records, and to map a drug to his multiple generic names (if it has) by splitting and matching texts.
+
+The criterion of duplication checking, please refer our paper.
+
+```{r}
+
+tic('data cleaning and reshaping')
+
+ADR_of_interest = 'Rhabdomyolysis'
+N = length(unique(REAC18Q3$primaryid))
+
+
+length(DEMO18Q3$primaryid)
+length(unique(DEMO18Q3$caseid)) 
+print('There is no duplicated records if above two values are equal')
+
+pid_list = unique(REAC18Q3[REAC18Q3$pt == ADR_of_interest,]$primaryid)
+cand_drugs_raw = unique(DRUG18Q3[DRUG18Q3$primaryid %in% pid_list,]$prod_ai)
+
+
+cand_drugs = lapply(strsplit(cand_drugs_raw,'\ |[\\]+'), unique)
+cand_drugs_first = na.omit(unique(sapply(cand_drugs, function(x){
+  x[[1]]
+})))
+cand_drugs_first = setdiff(cand_drugs_first, c("RED")) # manually rm wrong vocabulary
+test = (lapply(cand_drugs_first, function(x){
+  grep(x,cand_drugs_raw,ignore.case = T)
+}))
+names(test) = cand_drugs_first
+
+#test is a list whose element's name is standardised drug name and its value is index of cand_drugs_raw
+
+```
+
+Reshape the data to a sparse matrix, which rows are reports, columns are drugs and its values are the indicator of whether drugs were mentioned in the reports.
+
+Concate the outcome with data, the outcome is the occurence of ADE of interest with each reports.
+
+```{r}
+
+data = as.data.frame(matrix(nrow = N, ncol = length(test), dimnames = list(unique(REAC18Q3$primaryid), names(test))))
+for (i in 1:length(test)){
+  data[as.character(unique(DRUG18Q3[DRUG18Q3$prod_ai %in% cand_drugs_raw[test[[i]]],]$primaryid)), names(test[i])] = 1
+  #print(i)
+}
+data[is.na(data)] = 0
+
+Outcome = matrix(nrow = N,  ncol = 1, dimnames = list(rownames(data), ADR_of_interest) )
+Outcome[as.character(unique(REAC18Q3[REAC18Q3$pt == ADR_of_interest,]$primaryid)),] = 1
+Outcome[is.na(Outcome)] = 0
+
+new_data = as.data.frame(cbind(data, Outcome))
+
+toc()
+
+```
+
+Retrieve and organise domain knowledge from SIDER, which can be download from http://sideeffects.embl.de/download/
+
+In this demo, we manually retrieve it from website for the case study.
+
+```{r}
+
+t = '
+Benicar-HCT
+EACA
+K779
+LY146032
+Zyprexa Relprevv
+abacavir
+abacavir-lamivudine
+aliskiren
+aminophylline
+amiodarone
+amphetamine
+amphotericin B
+amprenavir
+aripiprazole
+asenapine
+atorvastatin
+benzathine penicillin
+bezafibrate
+bortezomib
+bupropion
+cabozantinib
+candesartan
+candesartan cilexetil
+cefdinir
+cerivastatin
+ciprofloxacin
+citalopram
+clarithromycin
+clomipramine
+clozapine
+colchicine
+cyclophosphamide
+cytarabine
+darunavir
+dasatinib
+delavirdine
+desflurane
+didanosine
+duloxetine
+efavirenz
+emtricitabine
+entacapone
+eprosartan
+erlotinib
+etravirine
+everolimus
+ezetimibe
+famotidine
+febuxostat
+felbamate
+fenofibrate
+fenofibric acid
+fluvastatin
+fluvoxamine
+fosamprenavir
+foscarnet
+fusidic acid
+gabapentin
+ganciclovir
+gemfibrozil
+hydrochlorothiazide
+ifosfamide
+imatinib
+indapamide
+indinavir
+irbesartan
+irbesartan-hydrochlorothiazide
+lamivudine
+lamotrigine
+lenalidomide
+losartan
+lovastatin
+lurasidone
+maraviroc
+melphalan
+milnacipran
+morphine
+nefazodone
+nelarabine
+nelfinavir
+nevirapine
+niacin
+ofloxacin
+olanzapine
+olmesartan
+olmesartan medoxomil
+oxaliplatin
+paliperidone
+pantoprazole
+penicillin
+pentamidine
+pitavastatin
+pramipexole
+pravastatin
+pregabalin
+propofol
+quetiapine
+rabeprazole
+raltegravir
+retinoic acid
+ribavirin
+risperidone
+rosuvastatin
+saquinavir
+sevoflurane
+simvastatin
+sorafenib
+sparfloxacin
+succinylcholine
+sulfamethoxazole
+sulfasalazine
+sunitinib
+tacrolimus
+telmisartan
+temsirolimus
+tenofovir
+tenofovir disoproxil fumarate
+terbinafine
+theophylline
+thymidine
+tipranavir
+tizanidine
+tolcapone
+tolvaptan
+trabectedin
+trametinib
+trien
+trospium chloride
+v 1784
+valsartan
+venlafaxine
+ziconotide
+zidovudine
+zidovudine/lamivudine
+ziprasidone
+zonisamide
+'
+
+cit00 = read.table(text = t, sep = '\n', stringsAsFactors =F)[,1]
+
+#preliminary check whether these medicines are in the analysis 
+cit0 = toupper(cit00[sapply(cit00, function(x){
+  sum(grepl(x, names(test), ignore.case = T))
+})>0])
+cit0 = cit0[cit0 %in% names(test)]
+
+toc()
+
+```
+
+Level 1 (The codes beyong this line would be running, demostration purpose only)
+
+alpha set as 0.01 for a demo purpose
+
+How adaptively determine alpha, please refer our paper
+
+```{r eval=FALSE}
+
+library(bnlearn)
+
+tic('level 1')
+
+library(bnlearn)
+ci_res = lapply(names(test), function(x){
+  ci.test(x = x, y = colnames(Outcome), data = new_data)
+})
+
+ci_rank = matrix(unlist(lapply(ci_res, function(x){
+  c(unname(x$statistic), x$p.value)
+})), ncol = 2, byrow = T)
+ci_rank = as.data.frame(ci_rank)
+rownames(ci_rank) = names(test)
+colnames(ci_rank) = c('x2', 'p')
+
+ci_res_1 = lapply(setdiff(rownames(ci_rank[ci_rank[,2]<0.01,]), cit0), function(x){
+  max(sapply(cit0, function(x,y){
+    ci.test(x = x, y = colnames(Outcome),z = y, data = new_data)$p.value
+  },x = x))
+})
+
+cit1 = setdiff(rownames(ci_rank[ci_rank[,2]<0.01,]), cit0)[ci_res_1<0.01]
+
+toc()
+
+```
+
+Level 2
+
+We require at least 4 cases for including a candidate combination into the test.
+
+```{r eval=FALSE}
+
+tic('level2')
+
+rest_drugs = setdiff(setdiff(names(test), cit0), cit1)
+
+final_res = list()
+for (i in 1:length(rest_drugs)){
+  for (j in (i+1):length(rest_drugs)){
+    combined = data[,rest_drugs[i]] * data[,rest_drugs[j]]
+    if (sum(combined)>4){# minimum 4 cases as support
+      combined = matrix(combined, ncol = 1, byrow = T,dimnames = list(rownames(data), 'combined') )
+      combined = as.factor(combined)
+      temp = max(sapply(union(cit0,cit1), function(y){
+        ci.test(x = combined, y = new_data[,colnames(Outcome)],z = new_data[,y])$p.value
+      }))
+      if (temp <0.1){ # only record results with p-value < 0.1, to save memory space
+        final_res[length(final_res)+1] = temp
+        names(final_res)[length(final_res)] =paste(rest_drugs[i], rest_drugs[j], sep = ' + ')
+      }
+    }
+    #print(c(i,j))
+  }
+}
+toc()
+
+print(sort(final_res))
+
+toc()
+
+```
